@@ -1,165 +1,112 @@
-import uuid
+from django.contrib.auth.models import AbstractUser, BaseUserManager
 from django.db import models
-from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
-from django.utils.translation import gettext_lazy as _
 from phonenumber_field.modelfields import PhoneNumberField
-from django.utils import timezone
-from datetime import timedelta
-import random
+import uuid
 
-
-# ==========================================
-# 1. ENUMS (Choices)
-# ==========================================
-
-class SkillLevel(models.TextChoices):
-    BEGINNER = 'BEGINNER', _('Beginner')
-    INTERMEDIATE = 'INTERMEDIATE', _('Intermediate')
-    PRO = 'PRO', _('Pro')
-
-
-class PlayerRole(models.TextChoices):
-    BATSMAN = 'BATSMAN', _('Batsman')
-    BOWLER = 'BOWLER', _('Bowler')
-    ALL_ROUNDER = 'ALL_ROUNDER', _('All Rounder')
-    WICKET_KEEPER = 'WICKET_KEEPER', _('Wicket Keeper')
-    ANY = 'ANY', _('Any Role')
-
-
-# ==========================================
-# 2. ABSTRACT BASE MODEL
-# ==========================================
-
-class BaseModel(models.Model):
-    """
-    Abstract base model that provides self-updating
-    'created_at' and 'updated_at' fields.
-    """
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        abstract = True
-
-
-# ==========================================
-# 3. USER MANAGER
-# ==========================================
 
 class UserManager(BaseUserManager):
-    """Custom manager for the custom User model."""
+    """Custom user manager for phone-based authentication"""
 
-    def create_user(self, phone_number, password=None, **extra_fields):
-        if not phone_number:
-            raise ValueError('Users must have a phone number')
+    def create_user(self, phone, password=None, **extra_fields):
+        if not phone:
+            raise ValueError('The Phone field must be set')
 
-        user = self.model(phone_number=phone_number, **extra_fields)
+        user = self.model(phone=phone, **extra_fields)
         if password:
             user.set_password(password)
+        else:
+            user.set_unusable_password()
         user.save(using=self._db)
         return user
 
-    def create_superuser(self, phone_number, password=None, **extra_fields):
+    def create_superuser(self, phone, name, password=None, **extra_fields):
         extra_fields.setdefault('is_staff', True)
         extra_fields.setdefault('is_superuser', True)
-        extra_fields.setdefault('is_active', True)
 
-        if extra_fields.get('is_staff') is not True:
-            raise ValueError('Superuser must have is_staff=True.')
-        if extra_fields.get('is_superuser') is not True:
-            raise ValueError('Superuser must have is_superuser=True.')
+        if password is None:
+            raise ValueError("Superuser must have a password.")
 
-        return self.create_user(phone_number, password, **extra_fields)
+        user = self.model(phone=phone, name=name or '', **extra_fields)
+        user.set_password(password)
+        user.save(using=self._db)
+        return user
 
 
-# ==========================================
-# 4. USER MODEL
-# ==========================================
-
-class User(AbstractBaseUser, PermissionsMixin, BaseModel):
-    # IDs & Auth
+class User(AbstractUser):
+    """Custom User model extending AbstractUser"""
     user_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    phone_number = PhoneNumberField(unique=True, region='IN')
-    full_name = models.CharField(max_length=150)
-    email = models.EmailField(unique=True, blank=True, null=True)
-
-    # Cricket Profile
-    skill_level = models.CharField(max_length=20, choices=SkillLevel.choices, default=SkillLevel.BEGINNER)
-    primary_role = models.CharField(max_length=20, choices=PlayerRole.choices, default=PlayerRole.ALL_ROUNDER)
-
-    # Trust Metrics
-    reliability_score = models.DecimalField(max_digits=3, decimal_places=1, default=5.0)
-    no_shows = models.PositiveIntegerField(default=0)
-    games_played = models.PositiveIntegerField(default=0)
-
-    # Location Targeting
-    preferred_zone = models.CharField(max_length=100, blank=True, help_text="e.g. Gachibowli")
-
-    # System Fields
-    is_active = models.BooleanField(default=True)
-    is_staff = models.BooleanField(default=False)
-
+    phone = PhoneNumberField(unique=True, region='IN')
+    name = models.CharField(max_length=150, blank=True, default='')
+    email = models.EmailField(blank=True, null=True, unique=True)  # Optional
+    
+    SKILL_LEVEL_CHOICES = [
+        ('BEGINNER', 'Beginner'),
+        ('INTERMEDIATE', 'Intermediate'),
+        ('SERIOUS', 'Serious'),
+    ]
+    skill_level = models.CharField(max_length=20, choices=SKILL_LEVEL_CHOICES, default='BEGINNER')
+    SKILL_ROLE_CHOICES = [
+        ('BATSMAN', 'Batsman'),
+        ('BOWLER', 'Bowler'),
+        ('WICKET_KEEPER', 'Wicket Keeper'),
+        ('ALL_ROUNDER', 'All Rounder'),
+        ('ANY', 'Any Role'),
+    ]
+    skill_role = models.CharField(max_length=20, choices=SKILL_ROLE_CHOICES, default='ANY')
+    # Primary role the user prefers to play in matches
+    primary_role = models.CharField(max_length=20, choices=SKILL_ROLE_CHOICES, default='ANY')
+    # Gig economy fields
+    is_open_for_gigs = models.BooleanField(default=False)
+    hourly_rate = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    practice_role = models.CharField(max_length=20, choices=SKILL_ROLE_CHOICES, blank=True, default='')
+    # Basic profile fields
+    age = models.PositiveIntegerField(null=True, blank=True)
+    pin_code = models.CharField(max_length=10, blank=True, default='')
+    skill_video = models.FileField(upload_to='skill_videos/', blank=True, null=True)
+    # Ratings & stats
+    rating = models.DecimalField(max_digits=3, decimal_places=2, default=5.00)
+    reliability_score = models.DecimalField(max_digits=3, decimal_places=2, default=5.00)
+    wallet_balance = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
+    is_video_verified = models.BooleanField(default=False)
+    total_runs = models.PositiveIntegerField(default=0)
+    total_wickets = models.PositiveIntegerField(default=0)
+    matches_played = models.PositiveIntegerField(default=0)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    # Override username to use phone instead
+    username = None
+    USERNAME_FIELD = 'phone'
+    REQUIRED_FIELDS = []
+    
     objects = UserManager()
-
-    USERNAME_FIELD = 'phone_number'
-    REQUIRED_FIELDS = ['full_name']
-
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'User'
+        verbose_name_plural = 'Users'
+    
     def __str__(self):
-        return f"{self.full_name} ({self.phone_number})"
+        display_name = self.name or str(self.phone)
+        return f"{display_name} ({self.phone})"
 
 
-# ==========================================
-# 5. OTP MODEL
-# ==========================================
-
-class OTP(BaseModel):
-    """Store OTP for phone number verification"""
+class OTP(models.Model):
+    """OTP model for phone authentication"""
     phone_number = PhoneNumberField(region='IN')
     otp = models.CharField(max_length=6)
     is_verified = models.BooleanField(default=False)
     expires_at = models.DateTimeField()
-
+    attempts = models.PositiveIntegerField(default=0)
+    full_name = models.CharField(max_length=150, blank=True)  # For registration
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
     class Meta:
         ordering = ['-created_at']
-
+        verbose_name = 'OTP'
+        verbose_name_plural = 'OTPs'
+    
     def __str__(self):
-        return f"OTP for {self.phone_number}"
-
-    @staticmethod
-    def generate_otp():
-        """Generate a 6-digit OTP"""
-        return str(random.randint(100000, 999999))
-
-    def is_valid(self):
-        """Check if OTP is still valid (not expired)"""
-        return timezone.now() < self.expires_at and not self.is_verified
-
-    @classmethod
-    def create_otp(cls, phone_number):
-        """Create a new OTP for a phone number"""
-        otp_code = cls.generate_otp()
-        expires_at = timezone.now() + timedelta(minutes=5)  # 5 minutes validity
-
-        # Invalidate previous OTPs for this phone number
-        cls.objects.filter(phone_number=phone_number, is_verified=False).delete()
-
-        otp_instance = cls.objects.create(
-            phone_number=phone_number,
-            otp=otp_code,
-            expires_at=expires_at
-        )
-        return otp_instance
-
-
-# ==========================================
-# 6. TEAM MODEL
-# ==========================================
-
-class Team(BaseModel):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    captain = models.ForeignKey(User, on_delete=models.CASCADE, related_name='captained_teams')
-    team_name = models.CharField(max_length=100, blank=True, null=True)
-    temp_player_count = models.PositiveIntegerField(default=0)
-
-    def __str__(self):
-        return self.team_name or f"{self.captain.full_name}'s Squad"
+        return f"OTP for {self.phone_number} - {self.otp}"

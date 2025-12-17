@@ -1,0 +1,9 @@
+Django>=5.2.8
+djangorestframework>=3.16.1
+django-cors-headers>=4.9.0
+django-phonenumber-field>=8.4.0
+phonenumberslite>=9.0.19
+psycopg2-binary>=2.9.11
+Pillow>=10.0.0
+razorpay>=1.4.0
+

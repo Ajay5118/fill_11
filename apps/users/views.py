@@ -1,260 +1,165 @@
-from rest_framework import generics, viewsets, status, permissions, filters
+from rest_framework import status, generics
+from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
-from rest_framework.views import APIView
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.authtoken.models import Token
-from django.contrib.auth import get_user_model
+from django.utils import timezone
+from datetime import timedelta
+import random
+from phonenumber_field.phonenumber import PhoneNumber
+
+from .models import OTP, User
 from .serializers import (
-    UserSerializer,
+    PhoneOTPRequestSerializer,
+    OTPVerifySerializer,
     UserRegistrationSerializer,
-    UserLoginSerializer,
-    ChangePasswordSerializer,
-    UserProfileSerializer,
-    UpdateProfileSerializer,
-    SendOTPSerializer,
-    VerifyOTPSerializer
+    UserSerializer
 )
-from .models import OTP
-
-User = get_user_model()
 
 
-# ==========================================
-# 1. OTP AUTHENTICATION VIEWS
-# ==========================================
-
-class SendOTPView(generics.GenericAPIView):
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def generate_otp(request):
     """
-    Endpoint: POST /api/users/send-otp/
-    Body: {"phone_number": "+919876543210"}
-    Logic: Generates and sends OTP to the phone number
+    Generate and send OTP to phone number
+    POST /api/auth/phone-otp/
+    Body: {"phone": "+919876543210"}
     """
-    serializer_class = SendOTPSerializer
-    permission_classes = [permissions.AllowAny]
+    serializer = PhoneOTPRequestSerializer(data=request.data)
 
-    def post(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        phone_number = serializer.validated_data['phone_number']
+    phone_str = serializer.validated_data['phone']
 
-        # Create OTP
-        otp_instance = OTP.create_otp(phone_number)
+    # Convert string to PhoneNumber object
+    phone_number = PhoneNumber.from_string(phone_str, region='IN')
 
-        # TODO: Send OTP via SMS (integrate with SMS provider)
-        # For now, we'll return it in response (ONLY FOR DEVELOPMENT)
-        # In production, remove the otp from response
+    # Generate 6-digit OTP
+    otp_code = str(random.randint(100000, 999999))
 
-        print(f"OTP for {phone_number}: {otp_instance.otp}")  # For development
+    # Set expiration time (10 minutes from now)
+    expires_at = timezone.now() + timedelta(minutes=10)
 
-        return Response({
-            "message": "OTP sent successfully",
-            "phone_number": str(phone_number),
-            "otp": otp_instance.otp,  # REMOVE THIS IN PRODUCTION
-            "expires_in": "5 minutes"
-        }, status=status.HTTP_200_OK)
+    # Invalidate all previous unverified OTPs for this phone number
+    OTP.objects.filter(
+        phone_number=phone_number,
+        is_verified=False,
+        expires_at__gt=timezone.now()
+    ).update(is_verified=True)
+
+    # Create new OTP record
+    otp_obj = OTP.objects.create(
+        phone_number=phone_number,
+        otp=otp_code,
+        expires_at=expires_at,
+        attempts=0,
+    )
+
+    # In production, send OTP via SMS service (Twilio, AWS SNS, etc.)
+    # For now, we'll return it in response (remove in production!)
+    print(f"OTP for {phone_number}: {otp_code}")  # Remove in production
+
+    return Response({
+        'message': 'OTP sent successfully',
+        'phone': phone_str,
+        'otp': otp_code,  # Remove this in production - only for testing
+        'expires_in': 600,  # seconds
+    }, status=status.HTTP_200_OK)
 
 
-class VerifyOTPView(generics.GenericAPIView):
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def verify_otp(request):
     """
-    Endpoint: POST /api/users/verify-otp/
-    Body: {
-        "phone_number": "+919876543210",
-        "otp": "123456",
-        "full_name": "Rahul Sharma"  // Required only for new users
-    }
-    Logic: Verifies OTP and logs in user. Creates new user if doesn't exist.
+    Verify OTP and return token
+    POST /api/auth/verify-otp/
+    Body: {"phone": "+919876543210", "otp": "123456"}
+
+    Returns:
+    - If user exists: token and user data
+    - If user doesn't exist: token and is_new_user flag (requires registration)
     """
-    serializer_class = VerifyOTPSerializer
-    permission_classes = [permissions.AllowAny]
+    serializer = OTPVerifySerializer(data=request.data)
 
-    def post(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        phone_number = serializer.validated_data['phone_number']
-        full_name = serializer.validated_data.get('full_name', '')
+    phone_str = serializer.validated_data['phone']
+    otp_obj = serializer.validated_data['otp_obj']
 
-        # Check if user exists
-        user, created = User.objects.get_or_create(
-            phone_number=phone_number,
-            defaults={
-                'full_name': full_name or str(phone_number),
-                'is_active': True
-            }
-        )
+    # Convert string to PhoneNumber object
+    phone_number = PhoneNumber.from_string(phone_str, region='IN')
 
-        # If user was just created but no name provided, raise error
-        if created and not full_name:
-            user.delete()
-            return Response({
-                "error": "full_name is required for new users"
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        # Generate or retrieve token
-        token, _ = Token.objects.get_or_create(user=user)
-
-        return Response({
-            "token": token.key,
-            "user": UserSerializer(user).data,
-            "message": "Login successful" if not created else "Registration successful"
-        }, status=status.HTTP_200_OK if not created else status.HTTP_201_CREATED)
-
-
-# ==========================================
-# 2. TRADITIONAL AUTHENTICATION VIEWS
-# ==========================================
-
-class UserRegistrationView(generics.CreateAPIView):
-    """
-    Endpoint: POST /api/users/register/
-    Logic: Creates a new user with password
-    """
-    queryset = User.objects.all()
-    serializer_class = UserRegistrationSerializer
-    permission_classes = [permissions.AllowAny]
-
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        user = serializer.save()
-
+    # Check if user already exists
+    try:
+        user = User.objects.get(phone=phone_number)
+        # User exists, return login response
         token, created = Token.objects.get_or_create(user=user)
 
         return Response({
-            "user": UserSerializer(user).data,
-            "token": token.key,
-            "message": "Registration Successful"
-        }, status=status.HTTP_201_CREATED)
-
-
-class UserLoginView(generics.GenericAPIView):
-    """
-    Endpoint: POST /api/users/login/
-    Logic: Login with phone number and password
-    """
-    serializer_class = UserLoginSerializer
-    permission_classes = [permissions.AllowAny]
-
-    def post(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-        user = serializer.validated_data['user']
-        token, created = Token.objects.get_or_create(user=user)
-
-        return Response({
-            "token": token.key,
-            "user_id": str(user.user_id),
-            "full_name": user.full_name,
-            "phone_number": str(user.phone_number),
-            "reliability_score": str(user.reliability_score)
+            'message': 'OTP verified successfully',
+            'token': token.key,
+            'is_new_user': False,
+            'user': UserSerializer(user).data,
         }, status=status.HTTP_200_OK)
 
-
-class UserLogoutView(APIView):
-    """
-    Endpoint: POST /api/users/logout/
-    Logic: Deletes the user's Token
-    """
-    permission_classes = [permissions.IsAuthenticated]
-
-    def post(self, request):
-        try:
-            request.user.auth_token.delete()
-        except (AttributeError, Token.DoesNotExist):
-            pass
-
-        return Response({"message": "Logged out successfully"}, status=status.HTTP_200_OK)
-
-
-# ==========================================
-# 3. PROFILE MANAGEMENT
-# ==========================================
-
-class UserProfileView(generics.RetrieveUpdateAPIView):
-    """
-    Endpoint: GET/PUT/PATCH /api/users/profile/
-    Logic: Get or Update the current logged-in user's details
-    """
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_object(self):
-        return self.request.user
-
-    def get_serializer_class(self):
-        if self.request.method in ['PUT', 'PATCH']:
-            return UpdateProfileSerializer
-        return UserProfileSerializer
-
-
-class ChangePasswordView(generics.UpdateAPIView):
-    """
-    Endpoint: PUT /api/users/change-password/
-    Logic: Changes password
-    """
-    serializer_class = ChangePasswordSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_object(self):
-        return self.request.user
-
-    def update(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-        user = request.user
-        user.set_password(serializer.validated_data['new_password'])
-        user.save()
-
-        # Invalidate old token and create new one
-        Token.objects.filter(user=user).delete()
+    except User.DoesNotExist:
+        # User doesn't exist - create temporary user and return token
+        # User must complete registration in the next step
+        user = User.objects.create_user(phone=phone_number)
         token = Token.objects.create(user=user)
 
         return Response({
-            "message": "Password updated successfully",
-            "token": token.key
+            'message': 'OTP verified successfully. Please complete registration.',
+            'token': token.key,
+            'is_new_user': True,
+            'phone': phone_str,
         }, status=status.HTTP_200_OK)
 
 
-# ==========================================
-# 4. UTILITY VIEWS (Leaderboard & Search)
-# ==========================================
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def complete_registration(request):
+    """
+    Complete user registration after OTP verification
+    POST /api/auth/register/
+    Headers: Authorization: Token <token>
+    Body: {
+        "name": "John Doe",  // required
+        "age": 25,  // required
+        "skill_level": "BEGINNER",  // required (BEGINNER, INTERMEDIATE, SERIOUS)
+        "skill_role": "BATSMAN",  // required (BATSMAN, BOWLER, WICKET_KEEPER, ALL_ROUNDER, ANY)
+        "pin_code": "500001",  // required
+        "email": "john@example.com"  // optional
+    }
+    """
+    user = request.user
 
-class LeaderboardView(generics.ListAPIView):
-    """
-    Endpoint: GET /api/users/leaderboard/
-    Logic: Returns top 50 users sorted by reliability score
-    """
+    # Check if user has already completed registration (has a name)
+    if user.name:
+        return Response({
+            'message': 'User already registered',
+            'user': UserSerializer(user).data
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    serializer = UserRegistrationSerializer(instance=user, data=request.data, partial=False)
+
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    serializer.save()
+
+    return Response({
+        'message': 'Registration completed successfully',
+        'user': UserSerializer(user).data,
+    }, status=status.HTTP_201_CREATED)
+
+
+class UserProfileView(generics.RetrieveUpdateAPIView):
+    """Get and update user profile"""
     serializer_class = UserSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAuthenticated]
 
-    def get_queryset(self):
-        return User.objects.filter(is_active=True).order_by('-reliability_score', 'no_shows')[:50]
-
-
-class SearchUsersView(generics.ListAPIView):
-    """
-    Endpoint: GET /api/users/search/?search=Rahul
-    Logic: Find players by Name or Phone Number
-    """
-    serializer_class = UserSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    queryset = User.objects.filter(is_active=True)
-    filter_backends = [filters.SearchFilter]
-    search_fields = ['full_name', 'phone_number']
-
-
-# ==========================================
-# 5. VIEWSET (For Admin/General Access)
-# ==========================================
-
-class UserViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    Endpoint: GET /api/users/
-    Logic: Read-only view of all users
-    """
-    queryset = User.objects.filter(is_active=True)
-    serializer_class = UserSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [filters.SearchFilter]
-    search_fields = ['full_name', 'phone_number']
+    def get_object(self):
+        return self.request.user

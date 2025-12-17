@@ -1,538 +1,662 @@
-# apps/matches/views.py
-
-from rest_framework import viewsets, status
-from rest_framework.decorators import action
+from rest_framework import viewsets, status, generics
+from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, AllowAny
-from django.shortcuts import get_object_or_404
+from rest_framework.permissions import IsAuthenticated
+from django.db.models import Q, Count
 from django.utils import timezone
-from django.db import transaction
-from decimal import Decimal
+from datetime import timedelta, datetime
+from django.conf import settings
+from django.contrib.auth import get_user_model
 import math
+try:
+    import razorpay
+except ImportError:
+    razorpay = None
 
-from .models import Match, Vacancy, Venue, GroundCheckin, EscrowTransaction
+from .models import (
+    Turf, Match, MatchJoinRequest, MatchPlayer,
+    Transaction, Club, Bowler, NetMateBooking,
+    Vacancy, EscrowTransaction, GroundCheckin,
+    MatchScorecard, PlayerMatchStat
+)
 from .serializers import (
-    MatchSerializer,
-    MatchListSerializer,
-    VacancySerializer,
-    VenueSerializer,
-    GroundCheckinSerializer,
-    EscrowTransactionSerializer,
-    JoinVacancySerializer,
-    GPSCheckinSerializer,
-    AddVacancySerializer,
+    TurfSerializer, MatchSerializer, MatchJoinRequestSerializer,
+    MatchPlayerSerializer, TransactionSerializer, ClubSerializer,
+    VacancySerializer, EscrowTransactionSerializer, GroundCheckinSerializer,
+    MatchScorecardSerializer, PlayerMatchStatSerializer,
+    BowlerSerializer, NetMateBookingSerializer
 )
 
-
-# ==================== UTILITY FUNCTIONS ====================
-
-def calculate_haversine_distance(lat1, lon1, lat2, lon2):
-    """
-    Calculate the great circle distance between two points
-    on the earth (specified in decimal degrees).
-    Returns distance in meters.
-
-    Formula:
-    a = sin²(Δφ/2) + cos φ1 ⋅ cos φ2 ⋅ sin²(Δλ/2)
-    c = 2 ⋅ atan2(√a, √(1−a))
-    d = R ⋅ c
-
-    where φ is latitude, λ is longitude, R is earth's radius (6371 km)
-    """
-    # Radius of the Earth in meters
-    R = 6371000
-
-    # Convert decimal degrees to radians
-    lat1_rad = math.radians(lat1)
-    lon1_rad = math.radians(lon1)
-    lat2_rad = math.radians(lat2)
-    lon2_rad = math.radians(lon2)
-
-    # Haversine formula
-    dlat = lat2_rad - lat1_rad
-    dlon = lon2_rad - lon1_rad
-
-    a = math.sin(dlat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-    distance = R * c
-
-    return distance
+User = get_user_model()
 
 
-# ==================== PERMISSIONS ====================
-
-class IsMatchCaptain(IsAuthenticated):
-    """
-    Custom permission to only allow captains of a match to edit it.
-    """
-
-    def has_object_permission(self, request, view, obj):
-        # Read permissions are allowed to any authenticated user
-        if request.method in ['GET', 'HEAD', 'OPTIONS']:
-            return True
-
-        # Write permissions are only allowed to the captain
-        return obj.host_team.captain == request.user
+def _haversine_distance_m(lat1, lon1, lat2, lon2):
+    """Return distance in meters between two GPS points."""
+    # convert decimal degrees to radians
+    rlat1, rlon1, rlat2, rlon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlon = rlon2 - rlon1
+    dlat = rlat2 - rlat1
+    a = math.sin(dlat / 2) ** 2 + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2) ** 2
+    c = 2 * math.asin(math.sqrt(a))
+    r = 6371000  # Radius of earth in meters
+    return r * c
 
 
-# ==================== VENUE VIEWSET ====================
-
-class VenueViewSet(viewsets.ModelViewSet):
-    """
-    ViewSet for Venue CRUD operations
-    """
-    queryset = Venue.objects.all()
-    serializer_class = VenueSerializer
-
-    def get_permissions(self):
-        """
-        Allow anyone to view venues, but only authenticated users to create
-        """
-        if self.action in ['list', 'retrieve']:
-            return [AllowAny()]
-        return [IsAuthenticated()]
-
-    @action(detail=False, methods=['get'], permission_classes=[AllowAny])
-    def nearby(self, request):
-        """
-        Get venues near a specific location
-        Query params: lat, long, radius (in km, default 5)
-        """
-        try:
-            user_lat = float(request.query_params.get('lat'))
-            user_long = float(request.query_params.get('long'))
-            radius_km = float(request.query_params.get('radius', 5))
-        except (TypeError, ValueError):
-            return Response(
-                {"error": "Invalid lat, long, or radius parameters"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Get all venues and calculate distances
-        venues = Venue.objects.all()
-        nearby_venues = []
-
-        for venue in venues:
-            distance = calculate_haversine_distance(
-                user_lat, user_long,
-                venue.gps_lat, venue.gps_long
-            )
-
-            if distance <= radius_km * 1000:  # Convert km to meters
-                venue_data = VenueSerializer(venue).data
-                venue_data['distance_meters'] = round(distance, 2)
-                nearby_venues.append(venue_data)
-
-        # Sort by distance
-        nearby_venues.sort(key=lambda x: x['distance_meters'])
-
-        return Response(nearby_venues)
-
-
-# ==================== VACANCY VIEWSET ====================
-
-class VacancyViewSet(viewsets.ModelViewSet):
-    """
-    ViewSet for Vacancy CRUD operations
-    """
-    queryset = Vacancy.objects.select_related('match', 'match__venue').all()
-    serializer_class = VacancySerializer
+class TurfViewSet(viewsets.ModelViewSet):
+    """ViewSet for Turf management"""
+    queryset = Turf.objects.all()
+    serializer_class = TurfSerializer
     permission_classes = [IsAuthenticated]
-
+    
     def get_queryset(self):
-        """
-        Filter vacancies based on query parameters
-        """
+        """Filter turfs by location if provided"""
         queryset = super().get_queryset()
+        lat = self.request.query_params.get('lat')
+        lng = self.request.query_params.get('lng')
+        
+        # TODO: Implement distance-based filtering
+        # For now, return all turfs
+        
+        return queryset
 
-        # Filter by status
-        status_filter = self.request.query_params.get('status')
-        if status_filter:
-            queryset = queryset.filter(status=status_filter)
-
-        # Filter by match
-        match_id = self.request.query_params.get('match_id')
-        if match_id:
-            queryset = queryset.filter(match__match_id=match_id)
-
-        # Only open vacancies
-        only_open = self.request.query_params.get('only_open')
-        if only_open and only_open.lower() == 'true':
-            queryset = queryset.filter(status='OPEN')
-
-        return queryset.order_by('-created_at')
-
-
-# ==================== MATCH VIEWSET ====================
 
 class MatchViewSet(viewsets.ModelViewSet):
-    """
-    ViewSet for Match CRUD operations with custom actions
-    """
-    queryset = Match.objects.select_related(
-        'host_team', 'host_team__captain', 'visitor_team', 'venue'
-    ).prefetch_related('vacancies').all()
+    """ViewSet for Match management"""
+    queryset = Match.objects.all()
+    serializer_class = MatchSerializer
     permission_classes = [IsAuthenticated]
-
-    def get_serializer_class(self):
-        """Use different serializers for list and detail views"""
-        if self.action == 'list':
-            return MatchListSerializer
-        return MatchSerializer
-
-    def get_permissions(self):
-        """
-        Allow anyone to view matches, but only authenticated users for other actions
-        """
-        if self.action in ['list', 'retrieve']:
-            return [AllowAny()]
-        return [IsAuthenticated()]
-
+    
     def get_queryset(self):
-        """
-        Filter matches based on query parameters
-        """
+        """Filter matches based on query parameters"""
         queryset = super().get_queryset()
-
-        # Filter upcoming matches
-        upcoming = self.request.query_params.get('upcoming')
-        if upcoming and upcoming.lower() == 'true':
-            queryset = queryset.filter(
-                start_time__gt=timezone.now(),
-                is_cancelled=False
-            )
-
-        # Filter by ground status
-        ground_status = self.request.query_params.get('ground_status')
-        if ground_status:
-            queryset = queryset.filter(ground_status=ground_status)
-
-        # Filter by venue
-        venue_id = self.request.query_params.get('venue_id')
-        if venue_id:
-            queryset = queryset.filter(venue__venue_id=venue_id)
-
-        return queryset.order_by('-start_time')
-
+        
+        # Filter by status
+        status_filter = self.request.query_params.get('status', 'PENDING')
+        queryset = queryset.filter(status=status_filter)
+        
+        # Filter by date (upcoming matches)
+        queryset = queryset.filter(match_date__gte=timezone.now().date())
+        
+        # Filter by location (if turf location provided)
+        lat = self.request.query_params.get('lat')
+        lng = self.request.query_params.get('lng')
+        # TODO: Implement distance-based filtering
+        
+        # Filter by format
+        format_filter = self.request.query_params.get('format')
+        if format_filter:
+            queryset = queryset.filter(format=format_filter)
+        
+        # Filter by skill level
+        skill_level = self.request.query_params.get('skill_level')
+        if skill_level:
+            queryset = queryset.filter(required_skill_level=skill_level)
+        
+        return queryset.order_by('match_date', 'start_time')
+    
     def perform_create(self, serializer):
+        """Create match - only captain can create"""
+        serializer.save(captain=self.request.user)
+    
+    @action(detail=True, methods=['post'])
+    def join(self, request, pk=None):
         """
-        Override to set the host team captain to the current user
+        Player sends join request and pays deposit
+        POST /api/matches/<id>/join/
         """
-        serializer.save()
-
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+        match = self.get_object()
+        user = request.user
+        
+        # Check if match can accept more players
+        if not match.can_accept_more_players():
+            return Response(
+                {'error': 'Match is full. Maximum join requests reached.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check if user already sent a request
+        existing_request = MatchJoinRequest.objects.filter(
+            match=match,
+            player=user
+        ).first()
+        
+        if existing_request:
+            if existing_request.status == 'PENDING':
+                return Response(
+                    {'error': 'You already have a pending request for this match.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            elif existing_request.status == 'APPROVED':
+                return Response(
+                    {'error': 'You are already approved for this match.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        # Check if user is the captain
+        if match.captain == user:
+            return Response(
+                {'error': 'Captain cannot join their own match.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Create Razorpay order for deposit (₹250)
+        deposit_amount = 250.00
+        
+        # Initialize Razorpay client (you'll need to add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to settings)
+        razorpay_order_id = None
+        if razorpay:
+            try:
+                client = razorpay.Client(auth=(
+                    getattr(settings, 'RAZORPAY_KEY_ID', ''),
+                    getattr(settings, 'RAZORPAY_KEY_SECRET', '')
+                ))
+                
+                order_data = {
+                    'amount': int(deposit_amount * 100),  # Amount in paise
+                    'currency': 'INR',
+                    'receipt': f'match_{match.id}_deposit_{user.user_id}',
+                    'notes': {
+                        'match_id': str(match.id),
+                        'user_id': str(user.user_id),
+                        'type': 'deposit'
+                    }
+                }
+                
+                razorpay_order = client.order.create(data=order_data)
+                razorpay_order_id = razorpay_order['id']
+                
+            except Exception as e:
+                # If Razorpay is not configured, create order ID manually for testing
+                razorpay_order_id = f'test_order_{match.id}_{user.user_id}'
+        else:
+            # If Razorpay is not installed, create order ID manually for testing
+            razorpay_order_id = f'test_order_{match.id}_{user.user_id}'
+        
+        # Create join request
+        join_request = MatchJoinRequest.objects.create(
+            match=match,
+            player=user,
+            deposit_paid=deposit_amount,
+            razorpay_order_id=razorpay_order_id,
+            status='PENDING'
+        )
+        
+        serializer = MatchJoinRequestSerializer(join_request)
+        
+        return Response({
+            'message': 'Join request submitted successfully. Please complete the payment.',
+            'join_request': serializer.data,
+            'razorpay_order_id': razorpay_order_id,
+            'amount': deposit_amount
+        }, status=status.HTTP_201_CREATED)
+    
+    @action(detail=True, methods=['post'])
     def add_vacancy(self, request, pk=None):
-        """
-        Add a vacancy to a match. Only the captain can perform this action.
+        """Captain posts a vacancy/job for this match.
 
-        POST /api/matches/{match_id}/add_vacancy/
-        Body: {
-            "looking_for_role": "BATSMAN",
-            "count_needed": 2,
-            "cost_per_head": 200
-        }
+        POST /api/matches/matches/{id}/add_vacancy/
+        Body: {"role_needed": "BATSMAN", "count_needed": 2, "cost_per_head": 500.0}
         """
         match = self.get_object()
 
-        # Check if the user is the captain of the host team
-        if match.host_team.captain != request.user:
+        if match.captain != request.user:
             return Response(
-                {"error": "Only the match captain can add vacancies"},
+                {'error': 'Only captain can add vacancies.'},
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        # Validate input
-        serializer = AddVacancySerializer(data=request.data)
+        serializer = VacancySerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        # Create vacancy
-        vacancy = Vacancy.objects.create(
-            match=match,
-            looking_for_role=serializer.validated_data['looking_for_role'],
-            count_needed=serializer.validated_data['count_needed'],
-            cost_per_head=serializer.validated_data['cost_per_head'],
-            status='OPEN'
-        )
-
-        vacancy_serializer = VacancySerializer(vacancy)
+        vacancy = serializer.save(match=match, status='OPEN')
         return Response(
             {
-                "message": "Vacancy added successfully",
-                "vacancy": vacancy_serializer.data
+                'message': 'Vacancy created successfully.',
+                'vacancy': VacancySerializer(vacancy).data,
             },
-            status=status.HTTP_201_CREATED
+            status=status.HTTP_201_CREATED,
         )
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['post'])
     def join_vacancy(self, request, pk=None):
-        """
-        Join a vacancy by creating an escrow transaction.
+        """Player pays and joins a posted vacancy.
 
-        POST /api/matches/{match_id}/join_vacancy/
-        Body: {
-            "vacancy_id": "uuid-here"
-        }
+        POST /api/matches/matches/{id}/join_vacancy/
+        Body: {"vacancy_id": "..."}
         """
         match = self.get_object()
+        user = request.user
 
-        # Validate input
-        serializer = JoinVacancySerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        vacancy_id = serializer.validated_data['vacancy_id']
+        vacancy_id = request.data.get('vacancy_id')
+        if not vacancy_id:
+            return Response({'error': 'vacancy_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            with transaction.atomic():
-                # Get the vacancy with row-level locking to prevent race conditions
-                vacancy = Vacancy.objects.select_for_update().get(
-                    vacancy_id=vacancy_id,
-                    match=match
-                )
-
-                # Check if vacancy is still open and has slots
-                if vacancy.status != 'OPEN':
-                    return Response(
-                        {"error": "This vacancy is not open"},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-
-                if vacancy.filled_count >= vacancy.count_needed:
-                    return Response(
-                        {"error": "This vacancy is already full"},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-
-                # Check if user already joined this vacancy
-                existing_transaction = EscrowTransaction.objects.filter(
-                    match=match,
-                    payer=request.user,
-                    status='HELD'
-                ).first()
-
-                if existing_transaction:
-                    return Response(
-                        {"error": "You have already joined this match"},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-
-                # Create escrow transaction
-                escrow = EscrowTransaction.objects.create(
-                    match=match,
-                    payer=request.user,
-                    amount=Decimal(vacancy.cost_per_head),
-                    status='HELD',
-                    release_condition=f"Match completion or captain approval"
-                )
-
-                # Decrement count_needed and increment filled_count
-                vacancy.filled_count += 1
-
-                # Mark as filled if all slots are taken
-                if vacancy.filled_count >= vacancy.count_needed:
-                    vacancy.status = 'FILLED'
-
-                vacancy.save()
-
-                # Serialize response
-                escrow_serializer = EscrowTransactionSerializer(escrow)
-                vacancy_serializer = VacancySerializer(vacancy)
-
-                return Response(
-                    {
-                        "message": "Successfully joined the vacancy",
-                        "escrow_transaction": escrow_serializer.data,
-                        "vacancy": vacancy_serializer.data,
-                        "slots_remaining": max(0, vacancy.count_needed - vacancy.filled_count)
-                    },
-                    status=status.HTTP_201_CREATED
-                )
-
+            vacancy = Vacancy.objects.get(id=vacancy_id, match=match)
         except Vacancy.DoesNotExist:
-            return Response(
-                {"error": "Vacancy not found for this match"},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        except Exception as e:
-            return Response(
-                {"error": f"An error occurred: {str(e)}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response({'error': 'Vacancy not found for this match.'}, status=status.HTTP_404_NOT_FOUND)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
-    def gps_checkin(self, request, pk=None):
-        """
-        Perform GPS check-in to verify physical presence at venue.
-        Uses Haversine formula to calculate distance.
+        if vacancy.status != 'OPEN' or vacancy.count_needed <= 0:
+            return Response({'error': 'Vacancy is already filled.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        POST /api/matches/{match_id}/gps_checkin/
-        Body: {
-            "user_lat": 17.4485,
-            "user_long": 78.3908
-        }
-        """
-        match = self.get_object()
-
-        # Validate input
-        serializer = GPSCheckinSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        user_lat = serializer.validated_data['user_lat']
-        user_long = serializer.validated_data['user_long']
-
-        # Get venue coordinates
-        venue = match.venue
-        venue_lat = venue.gps_lat
-        venue_long = venue.gps_long
-
-        # Calculate distance using Haversine formula
-        distance = calculate_haversine_distance(
-            user_lat, user_long,
-            venue_lat, venue_long
+        # Create escrow record (payment is assumed handled by client/payment gateway)
+        escrow = EscrowTransaction.objects.create(
+            match=match,
+            payer=user,
+            amount=vacancy.cost_per_head,
+            status='HELD',
         )
 
-        # Check if user is within 50 meters
-        is_successful = distance < 50
-
-        # Create check-in record
-        checkin = GroundCheckin.objects.create(
+        # Attach player to match if not already
+        match_player, created = MatchPlayer.objects.get_or_create(
             match=match,
-            user=request.user,
-            user_lat=user_lat,
-            user_long=user_long,
-            is_successful=is_successful,
-            distance_from_venue=distance
+            player=user,
+            defaults={'final_amount_paid': vacancy.cost_per_head},
         )
 
-        # If successful, update match ground status to SECURED
-        if is_successful:
-            match.ground_status = 'SECURED'
-            match.save()
+        if created:
+            match.spots_filled += 1
+            match.save(update_fields=['spots_filled'])
 
-            checkin_serializer = GroundCheckinSerializer(checkin)
-            return Response(
-                {
-                    "message": "Check-in successful! Ground status updated to SECURED.",
-                    "distance_meters": round(distance, 2),
-                    "check_in": checkin_serializer.data
-                },
-                status=status.HTTP_200_OK
-            )
-        else:
-            # Calculate how far they need to move
-            distance_needed = distance - 50
-
-            checkin_serializer = GroundCheckinSerializer(checkin)
-            return Response(
-                {
-                    "error": "Check-in failed. You are too far from the venue.",
-                    "distance_meters": round(distance, 2),
-                    "distance_needed": round(distance_needed, 2),
-                    "message": f"You need to be within 50 meters. You are {round(distance, 2)} meters away.",
-                    "check_in": checkin_serializer.data
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
-    def my_participation(self, request, pk=None):
-        """
-        Check if the current user has joined this match
-
-        GET /api/matches/{match_id}/my_participation/
-        """
-        match = self.get_object()
-
-        # Check for escrow transaction
-        escrow = EscrowTransaction.objects.filter(
-            match=match,
-            payer=request.user
-        ).first()
-
-        # Check for check-in
-        checkin = GroundCheckin.objects.filter(
-            match=match,
-            user=request.user
-        ).first()
-
-        data = {
-            "is_participant": escrow is not None,
-            "has_checked_in": checkin is not None and checkin.is_successful,
-            "escrow_status": escrow.status if escrow else None,
-            "amount_held": float(escrow.amount) if escrow else 0
-        }
-
-        return Response(data)
-
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
-    def cancel_match(self, request, pk=None):
-        """
-        Cancel a match (only captain can do this)
-        Refunds all escrow transactions
-
-        POST /api/matches/{match_id}/cancel_match/
-        """
-        match = self.get_object()
-
-        # Check if user is the captain
-        if match.host_team.captain != request.user:
-            return Response(
-                {"error": "Only the match captain can cancel the match"},
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        # Check if match has already started
-        if match.start_time <= timezone.now():
-            return Response(
-                {"error": "Cannot cancel a match that has already started"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        with transaction.atomic():
-            # Mark match as cancelled
-            match.is_cancelled = True
-            match.save()
-
-            # Refund all escrow transactions
-            escrows = EscrowTransaction.objects.filter(
-                match=match,
-                status='HELD'
-            )
-
-            refund_count = 0
-            for escrow in escrows:
-                escrow.refund_payment()
-                refund_count += 1
-
-            # Mark all vacancies as expired
-            match.vacancies.update(status='EXPIRED')
+        vacancy.count_needed -= 1
+        if vacancy.count_needed <= 0:
+            vacancy.status = 'FILLED'
+        vacancy.save(update_fields=['count_needed', 'status'])
 
         return Response(
             {
-                "message": "Match cancelled successfully",
-                "refunds_processed": refund_count
+                'message': 'Joined vacancy successfully. Payment held in escrow.',
+                'vacancy': VacancySerializer(vacancy).data,
+                'escrow': EscrowTransactionSerializer(escrow).data,
             },
-            status=status.HTTP_200_OK
+            status=status.HTTP_201_CREATED,
         )
 
+    @action(detail=True, methods=['post'])
+    def gps_checkin(self, request, pk=None):
+        """GPS verification for venue (King of the Hill).
 
-# ==================== ESCROW VIEWSET ====================
+        POST /api/matches/matches/{id}/gps_checkin/
+        Body: {"lat": 17.3850, "lng": 78.4867}
+        """
+        match = self.get_object()
+        user = request.user
 
-class EscrowTransactionViewSet(viewsets.ReadOnlyModelViewSet):
+        lat = request.data.get('lat')
+        lng = request.data.get('lng')
+        if lat is None or lng is None:
+            return Response({'error': 'lat and lng are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            lat = float(lat)
+            lng = float(lng)
+        except (TypeError, ValueError):
+            return Response({'error': 'lat and lng must be numeric.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        venue = match.turf
+        venue_lat = venue.gps_lat
+        venue_lng = venue.gps_long
+
+        # Fallback to JSON location if explicit GPS not set
+        if venue_lat is None or venue_lng is None:
+            loc = venue.location or {}
+            venue_lat = loc.get('lat') or loc.get('latitude')
+            venue_lng = loc.get('lng') or loc.get('long') or loc.get('longitude')
+
+        if venue_lat is None or venue_lng is None:
+            return Response(
+                {'error': 'Venue coordinates not configured.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        distance_m = _haversine_distance_m(lat, lng, float(venue_lat), float(venue_lng))
+        is_success = distance_m <= 50.0
+
+        checkin = GroundCheckin.objects.create(
+            match=match,
+            user=user,
+            user_lat=lat,
+            user_long=lng,
+            distance_meters=distance_m,
+            is_successful=is_success,
+        )
+
+        # Update player check-in flag if they are part of the match
+        MatchPlayer.objects.filter(match=match, player=user).update(
+            has_checked_in=is_success,
+            check_in_location={'lat': lat, 'lng': lng},
+        )
+
+        if is_success and match.ground_status != 'SECURED':
+            match.ground_status = 'SECURED'
+            match.save(update_fields=['ground_status'])
+
+        serializer = GroundCheckinSerializer(checkin)
+        status_code = status.HTTP_200_OK if is_success else status.HTTP_400_BAD_REQUEST
+        return Response(serializer.data, status=status_code)
+
+    @action(detail=True, methods=['post'])
+    def submit_scorecard(self, request, pk=None):
+        """Captain submits scorecard and player stats.
+
+        POST /api/matches/matches/{id}/submit_scorecard/
+        Body: {
+          "winning_team_name": "Team A",
+          "summary_text": "Match summary...",
+          "players": [
+            {"user_id": "...", "runs": 30, "wickets": 2, "catches": 1},
+            ...
+          ]
+        }
+        """
+        match = self.get_object()
+
+        if match.captain != request.user:
+            return Response(
+                {'error': 'Only captain can submit scorecard.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        winning_team_name = request.data.get('winning_team_name', '')
+        summary_text = request.data.get('summary_text', '')
+
+        scorecard, _ = MatchScorecard.objects.update_or_create(
+            match=match,
+            defaults={
+                'winning_team_name': winning_team_name,
+                'summary_text': summary_text,
+            },
+        )
+
+        players_payload = request.data.get('players', []) or []
+        player_stats = []
+
+        for item in players_payload:
+            user_id = item.get('user_id')
+            if not user_id:
+                continue
+            try:
+                user = User.objects.get(user_id=user_id)
+            except User.DoesNotExist:
+                continue
+
+            runs = int(item.get('runs', 0) or 0)
+            wickets = int(item.get('wickets', 0) or 0)
+            catches = int(item.get('catches', 0) or 0)
+
+            stat, created = PlayerMatchStat.objects.update_or_create(
+                match=match,
+                user=user,
+                defaults={
+                    'runs': runs,
+                    'wickets': wickets,
+                    'catches': catches,
+                },
+            )
+            player_stats.append(stat)
+
+            # Update aggregate stats on user
+            user.total_runs += runs
+            user.total_wickets += wickets
+            if created:
+                user.matches_played += 1
+            user.save(update_fields=['total_runs', 'total_wickets', 'matches_played'])
+
+        # Mark match as completed
+        if match.status != 'COMPLETED':
+            match.status = 'COMPLETED'
+            match.save(update_fields=['status'])
+
+        # Release all held escrows for this match
+        EscrowTransaction.objects.filter(match=match, status='HELD').update(status='RELEASED')
+
+        return Response(
+            {
+                'message': 'Scorecard submitted successfully.',
+                'scorecard': MatchScorecardSerializer(scorecard).data,
+                'player_stats': PlayerMatchStatSerializer(player_stats, many=True).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=['get'])
+    def join_requests(self, request, pk=None):
+        """Get all join requests for a match (captain only)."""
+        match = self.get_object()
+
+        if match.captain != request.user:
+            return Response(
+                {'error': 'Only captain can view join requests.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        join_requests = match.join_requests.all()
+        serializer = MatchJoinRequestSerializer(join_requests, many=True)
+        return Response(serializer.data)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def approve_join_request(request, request_id):
     """
-    ViewSet for viewing escrow transactions (read-only)
+    Captain approves a join request
+    POST /api/join-requests/<id>/approve/
     """
-    queryset = EscrowTransaction.objects.select_related(
-        'match', 'payer', 'match__venue'
-    ).all()
-    serializer_class = EscrowTransactionSerializer
+    try:
+        join_request = MatchJoinRequest.objects.get(id=request_id)
+    except MatchJoinRequest.DoesNotExist:
+        return Response(
+            {'error': 'Join request not found.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+    
+    # Check if user is the captain
+    if join_request.match.captain != request.user:
+        return Response(
+            {'error': 'Only captain can approve join requests.'},
+            status=status.HTTP_403_FORBIDDEN
+        )
+    
+    # Check if request is pending
+    if join_request.status != 'PENDING':
+        return Response(
+            {'error': f'Join request is already {join_request.status.lower()}.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    # Check if match can accept more players
+    if not join_request.match.can_accept_more_players():
+        return Response(
+            {'error': 'Match is full. Cannot approve more players.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    # Approve the request
+    join_request.status = 'APPROVED'
+    join_request.save()
+    
+    # Update match spots_filled
+    match = join_request.match
+    match.spots_filled += 1
+    match.save()
+    
+    # Create MatchPlayer record
+    final_amount = match.price_per_player - join_request.deposit_paid
+    MatchPlayer.objects.create(
+        match=match,
+        player=join_request.player,
+        final_amount_paid=final_amount
+    )
+    
+    # Create transaction record for deposit
+    Transaction.objects.create(
+        user=join_request.player,
+        match=match,
+        amount=join_request.deposit_paid,
+        type='DEPOSIT',
+        is_successful=True
+    )
+    
+    serializer = MatchJoinRequestSerializer(join_request)
+    
+    return Response({
+        'message': 'Join request approved successfully.',
+        'join_request': serializer.data
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def reject_join_request(request, request_id):
+    """
+    Captain rejects a join request
+    POST /api/join-requests/<id>/reject/
+    """
+    try:
+        join_request = MatchJoinRequest.objects.get(id=request_id)
+    except MatchJoinRequest.DoesNotExist:
+        return Response(
+            {'error': 'Join request not found.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+    
+    # Check if user is the captain
+    if join_request.match.captain != request.user:
+        return Response(
+            {'error': 'Only captain can reject join requests.'},
+            status=status.HTTP_403_FORBIDDEN
+        )
+    
+    # Reject the request
+    join_request.status = 'REJECTED'
+    join_request.save()
+    
+    # Refund deposit (create refund transaction)
+    Transaction.objects.create(
+        user=join_request.player,
+        match=join_request.match,
+        amount=join_request.deposit_paid,
+        type='REFUND',
+        is_successful=True
+    )
+    
+    # Update user wallet
+    join_request.player.wallet_balance += join_request.deposit_paid
+    join_request.player.save()
+    
+    serializer = MatchJoinRequestSerializer(join_request)
+    
+    return Response({
+        'message': 'Join request rejected. Deposit refunded.',
+        'join_request': serializer.data
+    }, status=status.HTTP_200_OK)
+
+
+class NetMateBowlerListView(generics.ListAPIView):
+    """List available bowlers for NetMate"""
+    serializer_class = BowlerSerializer
     permission_classes = [IsAuthenticated]
-
+    
     def get_queryset(self):
-        """
-        Users can only see their own transactions
-        """
-        return super().get_queryset().filter(payer=self.request.user)
+        """Filter bowlers by availability and location"""
+        queryset = Bowler.objects.filter(is_available=True)
+        
+        # Filter by area if provided
+        area = self.request.query_params.get('area')
+        if area:
+            # Filter by available_areas JSON field
+            queryset = queryset.filter(available_areas__contains=[area])
+        
+        return queryset.order_by('-rating')
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def book_netmate(request):
+    """
+    Book a bowler for net practice
+    POST /api/netmate/book/
+    Body: {
+        "bowler_id": "...",
+        "date": "2024-01-15",
+        "start_time": "18:00:00",
+        "duration": 30,
+        "society_address": "...",
+        "location": {"lat": 17.3850, "lng": 78.4867}
+    }
+    """
+    serializer = NetMateBookingSerializer(data=request.data)
+    
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    bowler_id = serializer.validated_data['bowler'].id
+    duration = serializer.validated_data['duration']
+    
+    try:
+        bowler = Bowler.objects.get(id=bowler_id, is_available=True)
+    except Bowler.DoesNotExist:
+        return Response(
+            {'error': 'Bowler not found or not available.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+    
+    # Calculate total amount
+    if duration == 30:
+        total_amount = bowler.rate_30min
+    else:
+        total_amount = bowler.rate_60min
+    
+    # Create Razorpay order (100% upfront payment)
+    razorpay_order_id = None
+    if razorpay:
+        try:
+            client = razorpay.Client(auth=(
+                getattr(settings, 'RAZORPAY_KEY_ID', ''),
+                getattr(settings, 'RAZORPAY_KEY_SECRET', '')
+            ))
+            
+            order_data = {
+                'amount': int(total_amount * 100),  # Amount in paise
+                'currency': 'INR',
+                'receipt': f'netmate_{bowler.id}_{request.user.user_id}',
+                'notes': {
+                    'bowler_id': str(bowler.id),
+                    'user_id': str(request.user.user_id),
+                    'type': 'netmate_booking'
+                }
+            }
+            
+            razorpay_order = client.order.create(data=order_data)
+            razorpay_order_id = razorpay_order['id']
+            
+        except Exception as e:
+            razorpay_order_id = f'test_order_netmate_{bowler.id}_{request.user.user_id}'
+    else:
+        razorpay_order_id = f'test_order_netmate_{bowler.id}_{request.user.user_id}'
+    
+    # Create booking
+    booking = NetMateBooking.objects.create(
+        batsman=request.user,
+        bowler=bowler,
+        date=serializer.validated_data['date'],
+        start_time=serializer.validated_data['start_time'],
+        duration=duration,
+        society_address=serializer.validated_data['society_address'],
+        location=serializer.validated_data['location'],
+        total_amount=total_amount,
+        deposit_paid=total_amount,  # 100% upfront
+        razorpay_order_id=razorpay_order_id,
+        status='PENDING'
+    )
+    
+    serializer = NetMateBookingSerializer(booking)
+    
+    return Response({
+        'message': 'Booking created successfully. Please complete the payment.',
+        'booking': serializer.data,
+        'razorpay_order_id': razorpay_order_id,
+        'amount': total_amount
+    }, status=status.HTTP_201_CREATED)
+
