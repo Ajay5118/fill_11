@@ -3,12 +3,11 @@ services:
     name: fill11-backend
     env: python
     plan: free
-    buildCommand: "pip install -r requirements.txt"
+    buildCommand: "pip install -r requirements.txt && python manage.py migrate && python manage.py collectstatic --noinput"
     startCommand: "gunicorn fill11.wsgi:application --bind 0.0.0.0:8000"
     envVars:
       - key: PYTHON_VERSION
         value: 3.11
-      # These will be filled from the Render Postgres add-on or manually
       - key: POSTGRES_DB
         sync: false
       - key: POSTGRES_USER
