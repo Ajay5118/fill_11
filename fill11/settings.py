@@ -121,7 +121,7 @@ DATABASES = {
             "postgresql://postgres:12345@localhost:5432/FILL11",
         ),
         conn_max_age=600,
-        ssl_require=not DEBUG,
+        ssl_require=False,
     )
 }
 
