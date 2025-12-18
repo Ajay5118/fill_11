@@ -86,6 +86,9 @@ CORS_ALLOWED_ORIGINS = [
 
 CSRF_TRUSTED_ORIGINS = [
     "https://*.onrender.com",
+    "https://fill-11.onrender.com",
+    "http://localhost:3000",
+    "http://localhost:8080",
 ]
 
 # --------------------------------------------------
