@@ -13,7 +13,6 @@ from phonenumber_field.phonenumber import PhoneNumber
 
 class PhoneNumberEncoder(DjangoJSONEncoder):
     """Custom JSON encoder that handles PhoneNumber objects and Files"""
-
     def default(self, obj):
         if isinstance(obj, PhoneNumber):
             return str(obj)  # Convert PhoneNumber to string
@@ -29,10 +28,14 @@ def export_all_data():
 
     # Get all models
     for model in apps.get_models():
-        # Skip contenttypes and permissions
+        # Skip contenttypes, permissions, and admin logs
         if model._meta.app_label == 'contenttypes':
             continue
+        if model._meta.app_label == 'admin':  # Skip admin logs
+            continue
         if model._meta.model_name == 'permission':
+            continue
+        if model._meta.model_name == 'session':  # Skip sessions
             continue
 
         print(f"Exporting {model._meta.app_label}.{model._meta.model_name}...")

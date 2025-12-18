@@ -1,27 +1,5 @@
 [
   {
-    "model": "admin.logentry",
-    "pk": 1,
-    "fields": {
-      "action_time": "2025-12-11T07:11:14.939Z",
-      "user": "loki",
-      "content_type": "bowler",
-      "object_id": "856a2cbc-b48c-4f89-af3f-c0fe9e0f193b",
-      "object_repr": "ajay - ALL Bowler",
-      "action_flag": 1,
-      "change_message": "[{\"added\": {}}]"
-    }
-  },
-  {
-    "model": "sessions.session",
-    "pk": "k84pnx3bd3iiatuwo8qwumxhe7q72qur",
-    "fields": {
-      "session_key": "k84pnx3bd3iiatuwo8qwumxhe7q72qur",
-      "session_data": ".eJxVjDsOwjAQBe_iGlv-20tJzxmiXa9NAiiR8qkQd4dIKUB63cy8l-hwW_tuW-rcDSzOIhfHMUOSCQCl18wSIBkZvCPKtjpyTpx-M8LyqOPe8h3H26TKNK7zQGpX1EEXdZ24Pi-H-3fQ49LvdfbNF-1CwoJgU8wUMHqrjW_IMbYKkYyP2bryXWpANTJjyJpNICveH56UQKE:1vTaog:8VQFVvlCMnSkpEcZkduS5c5_sXEVe1gpw3ihdsbxt9I",
-      "expire_date": "2025-12-25T07:10:22.262Z"
-    }
-  },
-  {
     "model": "authtoken.token",
     "pk": "fea9b67abf0ecec020228ee3660090001dc540a2",
     "fields": {
